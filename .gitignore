@@ -4,6 +4,13 @@ build/
 *.a
 *.so
 
+# experiments binaries (sandbox 中直接编译产物)
+experiments/m5_fsm/fsm_demo
+experiments/m5_parser/crc_test
+experiments/m5_parser/m5_demo
+experiments/m5_parser/fake_stm32
+experiments/m5_parser/gateway
+
 # IDE
 .vscode/
 .idea/
