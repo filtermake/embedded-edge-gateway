@@ -336,10 +336,12 @@ CRC 计算:  CRC16({03, 02, 01, 90}) = 0x5CA0
 
 ## 附录 B:实现参考
 
-- 解析器实现:`experiments/m5_fsm/FrameParser.{h,cpp}`
-- CRC16 实现:`experiments/m5_fsm/protocol/CRC16.{h,cpp}`
-- STM32 发送端实现:`experiments/m5_fsm/protocol_tx.c`(待开发)
-- 测试用例:`experiments/m5_fsm/protocol/main.cpp`(待迁移到 GoogleTest)
+- 解析器实现(主):`src/protocol/FrameParser.{h,cpp}`
+- 解析器实现(学习版):`experiments/m5_parser/FrameParser.{h,cpp}`
+- CRC16 实现:`src/protocol/CRC16.{h,cpp}`
+- 单元测试:`experiments/m5_parser/main.cpp` + `experiments/m5_parser/test_crc16.cpp`(待迁移到 GoogleTest)
+- 端到端集成测试:`experiments/m5_parser/fake_stm32.cpp` + `experiments/m5_parser/gateway.cpp`
+- STM32 发送端实现:Project 2 仓库(待开发)
 
 ---
 
