@@ -54,7 +54,7 @@ void printHex(const std::vector<uint8_t>& data) {
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <pty_path>\n";
-        std::cerr << "Example: " << argv[0] << " /dev/pts/3\n";
+        std::cerr << "Example: " << argv[0] << " /tmp/ttyV0\n";
         return 1;
     }
     

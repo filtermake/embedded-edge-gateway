@@ -4,12 +4,14 @@ build/
 *.a
 *.so
 
-# experiments binaries (sandbox 中直接编译产物)
+# experiments binaries (各练习目录下的可执行产物)
 experiments/m5_fsm/fsm_demo
 experiments/m5_parser/crc_test
 experiments/m5_parser/m5_demo
 experiments/m5_parser/fake_stm32
 experiments/m5_parser/gateway
+experiments/**/*.out
+experiments/**/a.out
 
 # IDE
 .vscode/
