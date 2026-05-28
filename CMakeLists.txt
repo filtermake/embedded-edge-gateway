@@ -27,6 +27,7 @@ message(STATUS "C++ standard : ${CMAKE_CXX_STANDARD}")
 # 5. 引入子模块
 add_subdirectory(src/log)
 add_subdirectory(src/serial)
+add_subdirectory(src/protocol)
 
 # 6. 主程序
 add_executable(gateway src/main.cpp)
@@ -34,4 +35,5 @@ target_link_libraries(gateway PRIVATE
     gateway_options       # 编译选项
     log                   # 日志模块
     serial                # 串口模块
+    protocol              # M5 协议解析模块
 )
