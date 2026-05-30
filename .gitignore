@@ -20,6 +20,10 @@ experiments/m6_queue/test_queue
 experiments/m6_queue/test_shutdown
 experiments/m8_pool/test_future_pool
 experiments/m8_pool/test_pool
+experiments/m3_log/test_compile
+experiments/m3_log/test_conpile
+experiments/m3_log/test_throughput
+experiments/m3_log/test_timed_flush
 experiments/**/*.out
 experiments/**/a.out
 
