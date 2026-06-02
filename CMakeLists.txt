@@ -29,6 +29,7 @@ add_subdirectory(src/log)
 add_subdirectory(src/serial)
 add_subdirectory(src/protocol)
 add_subdirectory(src/concurrent)
+add_subdirectory(src/net)
 
 # 6. 主程序
 add_executable(gateway src/main.cpp)
