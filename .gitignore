@@ -24,6 +24,9 @@ experiments/m3_log/test_compile
 experiments/m3_log/test_conpile
 experiments/m3_log/test_throughput
 experiments/m3_log/test_timed_flush
+experiments/m7_epoll/server
+experiments/m7_epoll/zuse
+experiments/m7_epoll/channel_et
 experiments/**/*.out
 experiments/**/a.out
 
