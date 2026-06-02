@@ -10,7 +10,7 @@
 #include "EventLoop.h"
 #include <memory>
 
-void sendData(m7::EventLoop& loop, m7::channel* ch, const char* data, ssize_t len) {
+void sendData(gateway::EventLoop& loop, gateway::channel* ch, const char* data, ssize_t len) {
     ssize_t total = 0;
 
     if (ch->out_buf.empty()) {
@@ -57,9 +57,9 @@ int main() {
     bind(listen_fd, (const sockaddr*)&addr, sizeof(addr));
     listen(listen_fd, 10);
 
-    m7::EventLoop loop;
+    gateway::EventLoop loop;
 
-    std::shared_ptr<m7::channel> listen_channel = std::make_shared<m7::channel>();
+    std::shared_ptr<gateway::channel> listen_channel = std::make_shared<gateway::channel>();
     listen_channel->fd = listen_fd;
     listen_channel->events = EPOLLIN | EPOLLET;
     listen_channel->on_read = [listen_fd, &loop](){
@@ -72,11 +72,11 @@ int main() {
                 break;
             }
 
-            std::shared_ptr<m7::channel> client_channel = std::make_shared<m7::channel>();
+            std::shared_ptr<gateway::channel> client_channel = std::make_shared<gateway::channel>();
             client_channel->fd = client_fd;
             client_channel->events = EPOLLIN | EPOLLET;
 
-            m7::channel* ch_raw = client_channel.get();
+            gateway::channel* ch_raw = client_channel.get();
             client_channel->on_read = [client_fd, &loop, ch_raw](){
                 while(1) {
                     char buf[1024];

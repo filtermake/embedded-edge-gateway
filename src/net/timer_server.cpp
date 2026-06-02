@@ -12,7 +12,7 @@
 #include "EventLoop.h"
 #include <memory>
 
-void sendData(m7::EventLoop& loop, m7::channel* ch, const char* data, ssize_t len) {
+void sendData(gateway::EventLoop& loop, gateway::channel* ch, const char* data, ssize_t len) {
     ssize_t total = 0;
 
     if (ch->out_buf.empty()) {
@@ -69,10 +69,10 @@ int main() {
     value.it_interval.tv_nsec = 0;
     if (timerfd_settime(timerfd, 0, &value, NULL) == -1) { perror("settime"); return 1; }
 
-    m7::EventLoop loop;
+    gateway::EventLoop loop;
 
     const int TIMEOUT = 5;
-    std::shared_ptr<m7::channel> timer_channel = std::make_shared<m7::channel>();
+    std::shared_ptr<gateway::channel> timer_channel = std::make_shared<gateway::channel>();
     timer_channel->fd = timerfd;
     timer_channel->events = EPOLLIN;
     timer_channel->on_read = [timerfd, &loop, TIMEOUT](){
@@ -81,7 +81,7 @@ int main() {
 
         time_t now = time(nullptr);
         std::vector<int> timeout_fds;
-        loop.forEachChannel([&now, &TIMEOUT, &timeout_fds, &timerfd](m7::channel* ch){
+        loop.forEachChannel([&now, &TIMEOUT, &timeout_fds, &timerfd](gateway::channel* ch){
             if (ch->fd == timerfd) return;
             if (ch->timeout_exempt) return;
             if (now - ch->last_active > TIMEOUT) timeout_fds.push_back(ch->fd);
@@ -95,7 +95,7 @@ int main() {
 
     loop.addChannel(timer_channel);
 
-    std::shared_ptr<m7::channel> listen_channel = std::make_shared<m7::channel>();
+    std::shared_ptr<gateway::channel> listen_channel = std::make_shared<gateway::channel>();
     listen_channel->fd = listen_fd;
     listen_channel->events = EPOLLIN | EPOLLET;
     listen_channel->timeout_exempt = true;
@@ -109,12 +109,12 @@ int main() {
                 break;
             }
 
-            std::shared_ptr<m7::channel> client_channel = std::make_shared<m7::channel>();
+            std::shared_ptr<gateway::channel> client_channel = std::make_shared<gateway::channel>();
             client_channel->fd = client_fd;
             client_channel->events = EPOLLIN | EPOLLET;
             client_channel->last_active = time(nullptr);
 
-            m7::channel* ch_raw = client_channel.get();
+            gateway::channel* ch_raw = client_channel.get();
             client_channel->on_read = [client_fd, &loop, ch_raw](){
                 while(1) {
                     char buf[1024];

@@ -7,7 +7,7 @@
 #include <string>
 #include <ctime>
 
-namespace m7{
+namespace gateway{
 
 struct channel {
     int fd = -1;          // 默认 -1，析构时据此判断要不要关

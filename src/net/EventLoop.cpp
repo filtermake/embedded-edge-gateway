@@ -8,7 +8,7 @@
 #include <cerrno>
 #include <cstring>
 
-namespace m7{
+namespace gateway{
 
     EventLoop::EventLoop(){
         epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
