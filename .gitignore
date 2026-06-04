@@ -53,3 +53,6 @@ experiments/**/*.db
 
 # compile_commands (clangd)
 compile_commands.json
+
+# WSL mark-of-the-web 垃圾(NTFS ADS)
+*:Zone.Identifier
