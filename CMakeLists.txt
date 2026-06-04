@@ -30,6 +30,8 @@ add_subdirectory(src/serial)
 add_subdirectory(src/protocol)
 add_subdirectory(src/concurrent)
 add_subdirectory(src/net)
+add_subdirectory(src/db)
+add_subdirectory(src/mqtt)
 
 # 6. 主程序
 add_executable(gateway src/main.cpp)
@@ -39,4 +41,6 @@ target_link_libraries(gateway PRIVATE
     serial                # 串口模块
     protocol              # M5 协议解析模块
     concurrent            # M6+M8 队列与线程池模块
+    db                    # M12 SQLite 持久化模块
+    mqtt                  # M10 MQTT 客户端模块
 )
