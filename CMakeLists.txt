@@ -43,4 +43,5 @@ target_link_libraries(gateway PRIVATE
     concurrent            # M6+M8 队列与线程池模块
     db                    # M12 SQLite 持久化模块
     mqtt                  # M10 MQTT 客户端模块
+    net
 )
