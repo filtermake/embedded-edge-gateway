@@ -5,12 +5,33 @@
 #include <string>
 #include <cstdio>
 #include "Statement.h"
+#include <vector>
 
 namespace gateway {
 
+struct DataRow {
+    std::string device_id;
+    double      value;
+    long        ts;
+};
+
 class Database {
 public:
-    explicit Database(const std::string& path) {
+    explicit Database(const std::string& path, bool readonly = false) {
+        if (readonly) {
+            // 只读打开:库必须已存在(主链连接已建好)。最小权限:连接层禁写。
+            int rc = sqlite3_open_v2(path.c_str(), &db_,
+                                     SQLITE_OPEN_READONLY, nullptr);
+            if (rc != SQLITE_OK) {
+                std::string msg = db_ ? sqlite3_errmsg(db_) : "out of memory";
+                if (db_) sqlite3_close(db_);
+                db_ = nullptr;
+                throw std::runtime_error("sqlite3_open(readonly) failed: " + msg);
+            }
+            return;   // 只读连接到此为止:不建表、不开WAL、不缓存 insert 语句
+        }
+ 
+        // ----- 读写连接(主链):原逻辑不变 -----
         int rc = sqlite3_open(path.c_str(), &db_);
         if (rc != SQLITE_OK) {
             std::string msg = db_ ? sqlite3_errmsg(db_) : "out of memory";
@@ -20,7 +41,7 @@ public:
         }
         execNoThrow("PRAGMA journal_mode=WAL;");
         execNoThrow("PRAGMA synchronous=NORMAL;");
-
+ 
         const char* ddl =
             "CREATE TABLE IF NOT EXISTS device_data("
             " id        INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -35,8 +56,11 @@ public:
             db_ = nullptr;
             throw std::runtime_error("create table failed: " + msg);
         }
-
-        // 缓存 insert 语句:必须在建表之后 prepare(表不存在 prepare 会失败)
+ 
+        // [S5改] 建复合索引,加速 query 的 WHERE device_id=? ORDER BY ts DESC
+        execNoThrow("CREATE INDEX IF NOT EXISTS idx_dev_ts "
+                    "ON device_data(device_id, ts);");
+ 
         insertStmt_ = new Statement(db_,
             "INSERT INTO device_data(device_id, value, ts) VALUES(?, ?, ?);");
     }
@@ -58,6 +82,24 @@ public:
             fprintf(stderr, "[db] insert step failed: %s\n", sqlite3_errmsg(db_));
         }
         insertStmt_->reset();
+    }
+
+    std::vector<DataRow> query(const std::string& device_id, int limit) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::vector<DataRow> rows;
+        Statement st(db_,
+            "SELECT device_id, value, ts FROM device_data "
+            "WHERE device_id = ? ORDER BY ts DESC LIMIT ?;");
+        st.bind(1, device_id);
+        st.bind(2, static_cast<long>(limit));
+        while (st.step() == SQLITE_ROW) {
+            rows.push_back(DataRow{
+                st.column_text(0),
+                st.column_double(1),
+                static_cast<long>(st.column_int64(2))
+            });
+        }
+        return rows;
     }
 
     long count() {
