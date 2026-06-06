@@ -5,7 +5,7 @@ namespace gateway {
 
 class SerialPort {
 public:
-    explicit SerialPort(const char* path, speed_t baud);
+    explicit SerialPort(const char* path, speed_t baud, bool nonblock = false);
     ~SerialPort() noexcept;
 
     SerialPort(const SerialPort&) = delete;

@@ -10,8 +10,10 @@
 
 namespace gateway {
 
-SerialPort::SerialPort(const char* path, speed_t baud) {
-    fd_ = open(path, O_RDWR | O_NOCTTY);
+SerialPort::SerialPort(const char* path, speed_t baud, bool nonblock) {
+    int flags = O_RDWR | O_NOCTTY;
+    if (nonblock) flags |= O_NONBLOCK;
+    fd_ = open(path, flags);
     if (fd_ == -1) {
         int saved = errno;
         throw std::runtime_error(std::string("open '") + path + "' failed: " + strerror(saved));
