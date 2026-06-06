@@ -1,0 +1,26 @@
+[Unit]
+Description=Embedded Edge Gateway
+Documentation=https://github.com/<你的仓库地址>
+After=network-online.target
+Wants=network-online.target
+# 若依赖本机 mosquitto broker,取消下面两行注释,确保 broker 先起:
+After=mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gateway /etc/gateway.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+
+# ---- 安全加固(可选,但生产推荐)----
+# 网关只需读配置、写自己的数据库,不需要乱碰系统其他地方:
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# 允许写入数据库目录(配合 db_path=/var/lib/gateway/...):
+ReadWritePaths=/var/lib/gateway
+
+[Install]
+WantedBy=multi-user.target
