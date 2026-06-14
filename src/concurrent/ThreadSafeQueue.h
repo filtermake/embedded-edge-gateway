@@ -41,6 +41,17 @@ public:
         return value;
     }
 
+    std::optional<T> try_pop() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (queue_.empty()) {
+            return std::nullopt;
+        }
+        T value = std::move(queue_.front());
+        queue_.pop();
+        not_full_cv_.notify_one();
+        return value;
+    }
+
     bool empty() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return queue_.empty();
