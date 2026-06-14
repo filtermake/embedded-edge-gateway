@@ -3,6 +3,7 @@
 add_library(protocol STATIC
     CRC16.cpp
     FrameParser.cpp
+    FrameBuilder.cpp
 )
 
 # 头文件路径暴露给依赖者
