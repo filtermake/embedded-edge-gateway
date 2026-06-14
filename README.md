@@ -2,6 +2,7 @@
 
 > 一个用 C++17 写的、跑在树莓派上的嵌入式 Linux 边缘网关:把 STM32 传感器经串口采集的数据,经协议解析、线程池分发,双写到本地 SQLite 与云端 MQTT;同时支持云端下发命令、内嵌 HTTP 监控页,并以 systemd 服务落地、支持配置热加载。
 
+[![CI](https://github.com/manbaaa-out/embedded-edge-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/manbaaa-out/embedded-edge-gateway/actions/workflows/ci.yml)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)
 ![CMake](https://img.shields.io/badge/CMake-3.15%2B-064F8C?logo=cmake&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Raspberry%20Pi%204B-555)
