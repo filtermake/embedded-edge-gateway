@@ -1,5 +1,7 @@
 #pragma once
 #include <termios.h>
+#include <cstdint>
+#include <sys/types.h>
 
 namespace gateway {
 
@@ -15,6 +17,7 @@ public:
     SerialPort& operator=(SerialPort&& other) noexcept;
 
     int get() const noexcept;
+    ssize_t write(const uint8_t* data, size_t len) noexcept;
 
 private:
     void configure(speed_t baud);

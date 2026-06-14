@@ -56,6 +56,27 @@ int SerialPort::get() const noexcept {
     return fd_;
 }
 
+ssize_t SerialPort::write(const uint8_t* data, size_t len) noexcept {
+    size_t total = 0;
+    const uint8_t* p = data;
+    while (total < len) {
+        ssize_t n = ::write(fd_, p + total, len - total);  // 注意 ::write 全局命名空间,别递归调自己
+        if (n > 0) {
+            total += n;                    // 短写:累加,继续循环写剩下的
+        }
+        else if (n < 0 && errno == EINTR) {
+            continue;                       // 信号打断:重试(底层消化)
+        }
+        else if (n < 0 && errno == EAGAIN) {
+            break;                          // 缓冲满:上抛,跳出循环返回 total(部分写)
+        }
+        else {
+            return -1;                      // 真错误
+        }
+    }
+    return (ssize_t)total;                  // total==len 全写完;total<len 部分写(EAGAIN)
+}
+
 void SerialPort::configure(speed_t baud) {
     struct termios tio;
     if (tcgetattr(fd_, &tio) == -1) {
