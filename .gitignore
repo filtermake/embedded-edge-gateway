@@ -10,6 +10,7 @@ experiments/m5_parser/crc_test
 experiments/m5_parser/m5_demo
 experiments/m5_parser/fake_stm32
 experiments/m5_parser/gateway
+experiments/m5_parser/test_crc16
 experiments/m6_queue/demo_cv
 experiments/m6_queue/demo_safe
 experiments/m6_queue/demo_safe_tsan
