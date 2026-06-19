@@ -11,7 +11,7 @@
 
 #include <sys/signalfd.h>
 #include <sys/eventfd.h>        // [方案B-3] 跨线程唤醒主循环
-#include <sys/timerfd.h> 
+#include <sys/timerfd.h>
 #include <sys/epoll.h>
 #include <signal.h>
 #include <cerrno>
@@ -39,25 +39,6 @@ namespace frame_type {
     constexpr uint8_t kHeartbeat = 0x03;
     constexpr uint8_t kStatus    = 0x04;
 }
-
-// ============================================================
-//   下行命令:从 MQTT(mosquitto 线程)投递给主线程统一发送。
-//   单一写者原则:SerialPort 的 fd 只由主线程碰,mosquitto 线程不直接写串口,
-//   只把命令塞进线程安全队列 + 戳 eventfd 唤醒主循环。
-// ============================================================
-struct DownCmd {
-    uint8_t type;                  // M5 TYPE(0x20/0x21/0x22)
-    std::vector<uint8_t> arg;      // 命令参数(不含 seq,seq 由主线程发送时分配)
-};
-
-// 在途命令表:只在主线程访问(发命令的 eventfd 回调 + 收 ACK 的 parser 回调
-//   + 超时扫描的 timerfd 回调,三者都在主线程)→ 无需加锁。
-struct InflightCmd {
-    uint8_t type;                  // 命令类型(重发要用)
-    std::vector<uint8_t> arg;      // 命令参数(不含 seq,重发要用)
-    time_t  sent_time;             // 发送时间(超时判断)
-    int     retry_count;           // 已重试次数
-};
 
 std::vector<Record> decodeFrame(const gateway::Frame& f) {
     std::vector<Record> out;
@@ -90,6 +71,25 @@ std::vector<Record> decodeFrame(const gateway::Frame& f) {
     }
     return out;
 }
+
+// ============================================================
+//   下行命令:从 MQTT(mosquitto 线程)投递给主线程统一发送。
+//   单一写者原则:SerialPort 的 fd 只由主线程碰,mosquitto 线程不直接写串口,
+//   只把命令塞进线程安全队列 + 戳 eventfd 唤醒主循环。
+// ============================================================
+struct DownCmd {
+    uint8_t type;                  // M5 TYPE(0x20/0x21/0x22)
+    std::vector<uint8_t> arg;      // 命令参数(不含 seq,seq 由主线程发送时分配)
+};
+
+// 在途命令表:只在主线程访问(发命令的 eventfd 回调 + 收 ACK 的 parser 回调
+//   + 超时扫描的 timerfd 回调,三者都在主线程)→ 无需加锁。
+struct InflightCmd {
+    uint8_t type;                  // 命令类型(重发要用)
+    std::vector<uint8_t> arg;      // 命令参数(不含 seq,重发要用)
+    time_t  sent_time;             // 发送时间(超时判断)
+    int     retry_count;           // 已重试次数
+};
 
 // 处理命令应答(0x05 查询应答 / 0x06 ACK):配对在途表 + 销账 + 发 MQTT。
 // 在主线程的 parser 回调里调用,与发命令、超时扫描同线程 → inflight 无需加锁。
@@ -145,6 +145,285 @@ static speed_t toBaud(int baud) {
         case 115200: return B115200;
         default:     return B115200;
     }
+}
+
+// ============================================================
+// FrameParser data-path 工厂:回调里按 type 分流 + 双写。
+//   关键:task 捕获 db/client 的 shared_ptr 【快照】(db, client 按值进 lambda),
+//   而非引用 —— 这样热加载 reset 外层 db/client 时,在飞 task 手里的旧对象不被销毁。
+// ============================================================
+static gateway::FrameParser::OnFrameCallback
+makeFrameHandler(std::unique_ptr<gateway::ThreadPool>& pool,
+                 std::shared_ptr<gateway::Database>& db,
+                 std::shared_ptr<gateway::MqttClient>& client,
+                 std::map<uint8_t, InflightCmd>& inflight) {
+    return [&pool, &db, &client, &inflight](const gateway::Frame& f){
+        // [方案B-4] 先按 type 分流:0x05/0x06 是命令应答,走配对;其余是传感器数据,走落库
+        if (f.type == 0x05 || f.type == 0x06) {
+            handleAck(f, inflight, *client);   // 配对 + 销账 + 发 MQTT
+            return;
+        }
+        // ---- 以下是原来的传感器数据双写逻辑,原样保留 ----
+        LOG_DEBUG("frame type=0x%02X len=%zu", f.type, f.payload.size());
+        long ts = static_cast<long>(time(nullptr));
+        for (const auto& r : decodeFrame(f)) {
+            std::string dev = r.device_id;
+            double      val = r.value;
+            auto db_snap     = db;
+            auto client_snap = client;
+            pool->submit([db_snap, client_snap, dev, val, ts]{
+                db_snap->insert(dev, val, ts);
+                client_snap->publish("gateway/up/" + dev, std::to_string(val));
+            });
+        }
+    };
+}
+
+// ============================================================
+// MQTT 下行 handler 工厂(在 mosquitto 线程跑,只翻译+投递,不碰串口)。
+// [方案B-3] topic 形如 gateway/cmd/<命令名>,payload 放裸参数。
+//   handler 把命令翻译成 DownCmd 塞进队列 + 戳 eventfd,绝不直接写串口。
+// 初次挂载与 SIGHUP 重连后复用同一份,杜绝两处拷贝漂移。
+// ============================================================
+static gateway::MqttClient::MessageHandler
+makeDownlinkHandler(gateway::ThreadSafeQueue<DownCmd>& cmd_queue, int evfd) {
+    return [&cmd_queue, evfd](const std::string& topic, const std::string& payload){
+        // 取 topic 最后一段作为命令名(同 pipeline.cpp 的 find_last_of)
+        std::string cmd_name = topic;
+        size_t pos = topic.find_last_of('/');
+        if (pos != std::string::npos) cmd_name = topic.substr(pos + 1);
+
+        DownCmd cmd;
+        bool valid = true;
+        if (cmd_name == "query_light") {
+            cmd.type = 0x20;                          // 查询光照,无参数
+        } else if (cmd_name == "query_th") {
+            cmd.type = 0x21;                          // 查询温湿度,无参数
+        } else if (cmd_name == "set_period") {
+            cmd.type = 0x22;                          // 设采样周期
+            // payload 是周期字符串如 "2000",转成 2 字节大端(协议 §3.4)
+            try {
+                int period = std::stoi(payload);
+                if (period < 0 || period > 0xFFFF) {
+                    LOG_WARN("set_period out of range: %s", payload.c_str());
+                    valid = false;
+                } else {
+                    cmd.arg.push_back(static_cast<uint8_t>((period >> 8) & 0xFF)); // 高字节
+                    cmd.arg.push_back(static_cast<uint8_t>(period & 0xFF));        // 低字节
+                }
+            } catch (...) {
+                LOG_WARN("set_period bad payload: %s", payload.c_str());
+                valid = false;
+            }
+        } else {
+            valid = false;
+            LOG_WARN("unknown downlink cmd: %s", cmd_name.c_str());
+        }
+
+        if (valid) {
+            cmd_queue.push(std::move(cmd));         // 塞队列(线程安全)
+            uint64_t one = 1;
+            if (write(evfd, &one, sizeof(one)) != sizeof(one)) {  // 戳 eventfd 唤醒主循环
+                LOG_WARN("%s", "eventfd notify failed");
+            }
+        }
+    };
+}
+
+// ============================================================
+// 串口 Channel 工厂:ET 模式,on_read 循环读到 EAGAIN,逐字节喂 FSM。
+// 引用捕获 port:热加载 reset port 后,这里自动看到新 port。parser 是栈对象,用 .
+// ============================================================
+static std::shared_ptr<gateway::channel>
+makeSerialChannel(std::shared_ptr<gateway::SerialPort>& port,
+                  gateway::FrameParser& parser) {
+    auto serial_channel = std::make_shared<gateway::channel>();
+    serial_channel->fd     = port->get();
+    serial_channel->events = EPOLLIN | EPOLLET;   // ET:必须循环读到 EAGAIN
+    serial_channel->on_read = [&port, &parser]() {
+        while (1) {
+            uint8_t buf[256];
+            ssize_t n = read(port->get(), buf, sizeof(buf));
+            if (n < 0) {
+                if (errno == EINTR)  continue;                 // 被信号打断,重试
+                if (errno == EAGAIN) break;                    // 读空,ET 下正常退出
+                LOG_ERROR("serial read error: %s", strerror(errno));
+                break;
+            } else if (n == 0) {
+                LOG_WARN("%s", "serial EOF (peer closed?)");      // 对端关闭(socat 那头),非 EAGAIN
+                break;
+            } else {
+                for (ssize_t i = 0; i < n; ++i)
+                    parser.feed(buf[i]);                       // 批量读、逐字节喂 FSM
+            }
+        }
+    };
+    return serial_channel;
+}
+
+// ============================================================
+// eventfd Channel 工厂(下行命令投递):
+// [方案B-3] mosquitto 线程把命令塞进 cmd_queue 后,往 evfd 写 1 唤醒主循环;
+//   主循环在这个回调里取空队列、组帧、写串口(单一写者,无需给 SerialPort 加锁)。
+// ============================================================
+static std::shared_ptr<gateway::channel>
+makeEventfdChannel(int evfd,
+                   gateway::ThreadSafeQueue<DownCmd>& cmd_queue,
+                   std::shared_ptr<gateway::SerialPort>& port,
+                   uint8_t& seq_counter,
+                   std::map<uint8_t, InflightCmd>& inflight) {
+    auto evt_channel = std::make_shared<gateway::channel>();
+    evt_channel->fd     = evfd;
+    evt_channel->events = EPOLLIN;   // 计数器通知用 LT 即可(同 signalfd)
+    evt_channel->on_read = [evfd, &cmd_queue, &port, &seq_counter, &inflight]() {
+        uint64_t cnt = 0;
+        read(evfd, &cnt, sizeof(cnt));
+
+        while (auto cmd = cmd_queue.try_pop()) {
+            uint8_t seq = seq_counter++;                  // 分配 seq
+            std::vector<uint8_t> payload;
+            payload.push_back(seq);
+            for (uint8_t b : cmd->arg) payload.push_back(b);
+            auto frame = gateway::buildFrame(cmd->type, payload);
+            ssize_t w = port->write(frame.data(), frame.size());
+            if (w != static_cast<ssize_t>(frame.size())) {
+                LOG_WARN("downlink send incomplete: type=0x%02X ret=%zd/%zu",
+                        cmd->type, w, frame.size());
+                // 发都没发成功,不登记在途表(没必要等它的 ACK)
+            } else {
+                LOG_INFO("downlink sent: type=0x%02X seq=%u (%zu bytes)",
+                        cmd->type, seq, frame.size());
+                // 登记进在途表,等 ACK / 超时重发
+                inflight[seq] = InflightCmd{cmd->type, cmd->arg,
+                                            static_cast<long>(time(nullptr)), 0};
+            }
+        }
+    };
+    return evt_channel;
+}
+
+// ============================================================
+// timerfd Channel 工厂(命令超时重试扫描):
+//   周期扫描在途命令表 inflight:超时未满重试次数则重发(同 seq,幂等),
+//   超满次数判失败删除。扫描周期 200ms < 超时时限 500ms,保证及时发现。
+//   与发命令(eventfd 回调)、收 ACK(parser 回调)同在主线程 → inflight 无锁。
+// ============================================================
+static std::shared_ptr<gateway::channel>
+makeCmdTimerChannel(int cmd_timerfd,
+                    std::map<uint8_t, InflightCmd>& inflight,
+                    std::shared_ptr<gateway::SerialPort>& port) {
+    auto cmd_timer_channel = std::make_shared<gateway::channel>();
+    cmd_timer_channel->fd     = cmd_timerfd;
+    cmd_timer_channel->events = EPOLLIN;   // LT
+    cmd_timer_channel->on_read = [cmd_timerfd, &inflight, &port]() {
+        uint64_t exp = 0;
+        read(cmd_timerfd, &exp, sizeof(exp));   // 必须读掉,否则 LT 反复触发
+
+        const long   TIMEOUT_SEC = 1;   // 超时时限(协议 §6.5 是 500ms;秒级 time() 精度有限,
+                                        //   取 1s 保守稳妥。要更精细可换 steady_clock 毫秒)
+        const int    MAX_RETRY   = 3;
+        long now = static_cast<long>(time(nullptr));
+
+        // 两阶段:先只读收集,再统一处理(避免遍历 inflight 时 erase/改导致迭代器失效)
+        std::vector<uint8_t> to_resend, to_fail;
+        for (auto& kv : inflight) {
+            if (now - kv.second.sent_time > TIMEOUT_SEC) {
+                if (kv.second.retry_count < MAX_RETRY) to_resend.push_back(kv.first);
+                else                                   to_fail.push_back(kv.first);
+            }
+        }
+        // 重发(同 seq,§6.2 幂等)
+        for (uint8_t seq : to_resend) {
+            auto& c = inflight[seq];
+            std::vector<uint8_t> payload;
+            payload.push_back(seq);                       // 同 seq!
+            for (uint8_t b : c.arg) payload.push_back(b);
+            auto frame = gateway::buildFrame(c.type, payload);
+            ssize_t w = port->write(frame.data(), frame.size());
+            if (w == static_cast<ssize_t>(frame.size())) {
+                c.retry_count++;
+                c.sent_time = now;                        // 重置计时
+                LOG_WARN("downlink RETRY seq=%u type=0x%02X (attempt %d/%d)",
+                        seq, c.type, c.retry_count, MAX_RETRY);
+            } else {
+                LOG_WARN("downlink retry send incomplete seq=%u ret=%zd", seq, w);
+            }
+        }
+        // 重试耗尽,判失败删除
+        for (uint8_t seq : to_fail) {
+            LOG_ERROR("downlink FAILED seq=%u type=0x%02X: no ACK after %d retries",
+                    seq, inflight[seq].type, MAX_RETRY);
+            inflight.erase(seq);
+            // 可选:发 MQTT 通知运维这条命令彻底失败
+            // client.publish("gateway/ack/" + std::to_string(seq), "timeout");
+        }
+    };
+    return cmd_timer_channel;
+}
+
+// ============================================================
+// SIGHUP 热加载策略:load-then-swap 后按 diff 仅重建真变了的资源。
+//   只在主线程的 signalfd 回调里调用(与发命令、收 ACK、超时扫描同线程)。
+//   db / client / port / serial_channel 均按【引用】传入:reset 外层指针后,
+//   各 channel 回调(引用捕获)与在飞 task(shared_ptr 快照)各自看到正确对象。
+// ============================================================
+static void reloadConfig(gateway::EventLoop& loop,
+                         std::shared_ptr<gateway::Database>& db,
+                         std::shared_ptr<gateway::MqttClient>& client,
+                         std::shared_ptr<gateway::SerialPort>& port,
+                         std::shared_ptr<gateway::channel>& serial_channel,
+                         gateway::FrameParser& parser,
+                         gateway::ThreadSafeQueue<DownCmd>& cmd_queue,
+                         int evfd) {
+    LOG_INFO("%s", "SIGHUP received, reloading config...");
+    auto r = gateway::ConfigManager::reload();
+    if (!r.ok) {
+        // load-then-swap 保证旧配置原封不动,无需任何回滚动作
+        LOG_WARN("%s","reload failed, keep running with old config");
+        return;
+    }
+    auto ncfg = gateway::ConfigManager::current();
+
+    // ---- A 档:改内存即生效 ----
+    gateway::Logger::setLevel(
+        static_cast<gateway::LogLevel>(ncfg->log_level));
+    // idle_timeout / report_n 等:用到处读 current() 自动生效
+
+    // ---- B 档:按 diff 重建,且仅重建真变了的 ----
+    // db:reset 旧 shared_ptr。在飞 task 持有旧 db 快照 → 旧对象续命到干完。
+    if (r.db_changed) {
+        LOG_INFO("%s","db_path changed → reopening database");
+        db = std::make_shared<gateway::Database>(ncfg->db_path);
+    }
+    // mqtt:unique/shared_ptr 替换绕过 MqttClient 不可移动。
+    //       旧 client 析构(stop loop/断连/destroy),新 client 建好。
+    if (r.mqtt_changed) {
+        LOG_INFO("%s","mqtt config changed → reconnecting");
+        client = std::make_shared<gateway::MqttClient>(
+            "gateway-main", ncfg->mqtt_host, ncfg->mqtt_port,
+            ncfg->mqtt_keepalive);
+        // 重连后要重新挂下行命令 handler + 重新订阅(否则下行命令断了)
+        client->setMessageHandler(makeDownlinkHandler(cmd_queue, evfd));
+        client->subscribe("gateway/cmd/#", 1);
+        client->loopStart();
+    }
+    // serial:fd 在 epoll 里,要连 Channel 一起换。
+    //   先 removeChannel 摘旧 fd(进 dying_,批末析构 close 旧 fd),
+    //   再重建 port,再建【全新】channel 指向新 fd ——
+    //   绝不复用旧 channel 改 fd:那会让旧 channel 的析构 close 错 fd
+    //   (shared_ptr 别名坑:旧 channel 已在 dying_ 里)。
+    if (r.serial_changed) {
+        LOG_INFO("%s","serial config changed → reopening port");
+        loop.removeChannel(serial_channel->fd);
+        port = std::make_shared<gateway::SerialPort>(
+            ncfg->serial_path.c_str(), toBaud(ncfg->serial_baud),
+            /*nonblock=*/true);
+        // 复用同一工厂重建(逻辑不变:引用捕获 port,自动用新 port)
+        auto new_ch = makeSerialChannel(port, parser);
+        loop.addChannel(new_ch);
+        serial_channel = new_ch;   // 外层变量指向新 channel(下次 SIGHUP 用新 fd)
+    }
+    LOG_INFO("%s","reload done");
 }
 
 int main(int argc, char* argv[]) {
@@ -205,6 +484,9 @@ int main(int argc, char* argv[]) {
         // ========================================================
         gateway::ThreadSafeQueue<DownCmd> cmd_queue;
         std::map<uint8_t, InflightCmd> inflight;
+        // seq 分配器:发送统一在主线程,seq 计数器不跨线程,无需加锁。
+        // 用 shared_ptr 让 lambda 按值捕获后仍指向同一个计数器(在主循环内单线程递增)。
+        uint8_t seq_counter = 0;
 
         // ========================================================
         // [P5] 主线程 Reactor 化:串口数据 + SIGHUP 信号 + 下行命令,统一事件驱动。
@@ -213,148 +495,26 @@ int main(int argc, char* argv[]) {
 
         // -------- 串口 Channel --------
         gateway::FrameParser parser;
-
-        // FrameParser:回调里解码 + 双写。
-        //   关键:task 捕获 db/client 的 shared_ptr 【快照】(db, client 按值进 lambda),
-        //   而非引用 —— 这样热加载 reset 外层 db/client 时,在飞 task 手里的旧对象不被销毁。
-        parser.setOnFrame([&pool, &db, &client, &inflight](const gateway::Frame& f){
-            // [方案B-4] 先按 type 分流:0x05/0x06 是命令应答,走配对;其余是传感器数据,走落库
-            if (f.type == 0x05 || f.type == 0x06) {
-                handleAck(f, inflight, *client);   // 配对 + 销账 + 发 MQTT
-                return;
-            }
-            // ---- 以下是原来的传感器数据双写逻辑,原样保留 ----
-            LOG_DEBUG("frame type=0x%02X len=%zu", f.type, f.payload.size());
-            long ts = static_cast<long>(time(nullptr));
-            for (const auto& r : decodeFrame(f)) {
-                std::string dev = r.device_id;
-                double      val = r.value;
-                auto db_snap     = db;
-                auto client_snap = client;
-                pool->submit([db_snap, client_snap, dev, val, ts]{
-                    db_snap->insert(dev, val, ts);
-                    client_snap->publish("gateway/up/" + dev, std::to_string(val));
-                });
-            }
-        });
-
-        auto serial_channel = std::make_shared<gateway::channel>();
-        serial_channel->fd     = port->get();
-        serial_channel->events = EPOLLIN | EPOLLET;   // ET:必须循环读到 EAGAIN
-        // 引用捕获 port:热加载 reset port 后,这里自动看到新 port。parser 是栈对象,用 .
-        serial_channel->on_read = [&port, &parser]() {
-            while (1) {
-                uint8_t buf[256];
-                ssize_t n = read(port->get(), buf, sizeof(buf));
-                if (n < 0) {
-                    if (errno == EINTR)  continue;                 // 被信号打断,重试
-                    if (errno == EAGAIN) break;                    // 读空,ET 下正常退出
-                    LOG_ERROR("serial read error: %s", strerror(errno));
-                    break;
-                } else if (n == 0) {
-                    LOG_WARN("%s", "serial EOF (peer closed?)");      // 对端关闭(socat 那头),非 EAGAIN
-                    break;
-                } else {
-                    for (ssize_t i = 0; i < n; ++i)
-                        parser.feed(buf[i]);                       // 批量读、逐字节喂 FSM
-                }
-            }
-        };
+        parser.setOnFrame(makeFrameHandler(pool, db, client, inflight));
+        auto serial_channel = makeSerialChannel(port, parser);
         loop.addChannel(serial_channel);
 
         // -------- eventfd Channel(下行命令投递)--------
-        // [方案B-3] mosquitto 线程把命令塞进 cmd_queue 后,往 evfd 写 1 唤醒主循环;
-        //   主循环在这个回调里取空队列、组帧、写串口(单一写者,无需给 SerialPort 加锁)。
         int evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (evfd == -1) {
             // eventfd 建不起来,下行命令链路不可用。这里致命退出(下行是核心功能)。
             LOG_ERROR("eventfd failed: %s", strerror(errno));
             return 1;
         }
-        auto evt_channel = std::make_shared<gateway::channel>();
-        evt_channel->fd     = evfd;
-        evt_channel->events = EPOLLIN;   // 计数器通知用 LT 即可(同 signalfd)
-        // seq 分配器:发送统一在主线程,seq 计数器不跨线程,无需加锁。
-        // 用 shared_ptr 让 lambda 按值捕获后仍指向同一个计数器(在主循环内单线程递增)。
-        uint8_t seq_counter = 0; 
-        evt_channel->on_read = [evfd, &cmd_queue, &port, &seq_counter, &inflight]() {
-            uint64_t cnt = 0;
-            read(evfd, &cnt, sizeof(cnt));
-
-            while (auto cmd = cmd_queue.try_pop()) {
-                uint8_t seq = seq_counter++;                  // 分配 seq
-                std::vector<uint8_t> payload;
-                payload.push_back(seq);
-                for (uint8_t b : cmd->arg) payload.push_back(b);
-                auto frame = gateway::buildFrame(cmd->type, payload);
-                ssize_t w = port->write(frame.data(), frame.size());
-                if (w != static_cast<ssize_t>(frame.size())) {
-                    LOG_WARN("downlink send incomplete: type=0x%02X ret=%zd/%zu",
-                            cmd->type, w, frame.size());
-                    // 发都没发成功,不登记在途表(没必要等它的 ACK)
-                } else {
-                    LOG_INFO("downlink sent: type=0x%02X seq=%u (%zu bytes)",
-                            cmd->type, seq, frame.size());
-                    // 登记进在途表,等 ACK / 超时重发
-                    inflight[seq] = InflightCmd{cmd->type, cmd->arg,
-                                                static_cast<long>(time(nullptr)), 0};
-                }
-            }
-        };
-        loop.addChannel(evt_channel);
+        loop.addChannel(makeEventfdChannel(evfd, cmd_queue, port, seq_counter, inflight));
 
         // -------- MQTT 下行 handler(在 mosquitto 线程跑,只翻译+投递,不碰串口)--------
-        // [方案B-3] topic 形如 gateway/cmd/<命令名>,payload 放裸参数。
-        //   handler 把命令翻译成 DownCmd 塞进队列 + 戳 eventfd,绝不直接写串口。
-        client->setMessageHandler([&cmd_queue, evfd](const std::string& topic, const std::string& payload){
-            // 取 topic 最后一段作为命令名(同 pipeline.cpp 的 find_last_of)
-            std::string cmd_name = topic;
-            size_t pos = topic.find_last_of('/');
-            if (pos != std::string::npos) cmd_name = topic.substr(pos + 1);
-
-            DownCmd cmd;
-            bool valid = true;
-            if (cmd_name == "query_light") {
-                cmd.type = 0x20;                          // 查询光照,无参数
-            } else if (cmd_name == "query_th") {
-                cmd.type = 0x21;                          // 查询温湿度,无参数
-            } else if (cmd_name == "set_period") {
-                cmd.type = 0x22;                          // 设采样周期
-                // payload 是周期字符串如 "2000",转成 2 字节大端(协议 §3.4)
-                try {
-                    int period = std::stoi(payload);
-                    if (period < 0 || period > 0xFFFF) {
-                        LOG_WARN("set_period out of range: %s", payload.c_str());
-                        valid = false;
-                    } else {
-                        cmd.arg.push_back(static_cast<uint8_t>((period >> 8) & 0xFF)); // 高字节
-                        cmd.arg.push_back(static_cast<uint8_t>(period & 0xFF));        // 低字节
-                    }
-                } catch (...) {
-                    LOG_WARN("set_period bad payload: %s", payload.c_str());
-                    valid = false;
-                }
-            } else {
-                valid = false;
-                LOG_WARN("unknown downlink cmd: %s", cmd_name.c_str());
-            }
-
-            if (valid) {
-                cmd_queue.push(std::move(cmd));         // 塞队列(线程安全)
-                uint64_t one = 1;
-                if (write(evfd, &one, sizeof(one)) != sizeof(one)) {  // 戳 eventfd 唤醒主循环
-                    LOG_WARN("%s", "eventfd notify failed");
-                }
-            }
-        });
+        client->setMessageHandler(makeDownlinkHandler(cmd_queue, evfd));
         client->subscribe("gateway/cmd/#", 1);
         client->loopStart();
         LOG_INFO("mqtt connected: %s:%d", cfg->mqtt_host.c_str(), cfg->mqtt_port);
 
         // -------- timerfd Channel(命令超时重试扫描)--------
-        //   周期扫描在途命令表 inflight:超时未满重试次数则重发(同 seq,幂等),
-        //   超满次数判失败删除。扫描周期 200ms < 超时时限 500ms,保证及时发现。
-        //   与发命令(eventfd 回调)、收 ACK(parser 回调)同在主线程 → inflight 无锁。
         int cmd_timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         if (cmd_timerfd == -1) {
             LOG_WARN("cmd timerfd failed: %s — 超时重试不可用", strerror(errno));
@@ -363,54 +523,7 @@ int main(int argc, char* argv[]) {
             cts.it_value.tv_sec = 0;     cts.it_value.tv_nsec = 200 * 1000 * 1000;    // 首次 200ms
             cts.it_interval.tv_sec = 0;  cts.it_interval.tv_nsec = 200 * 1000 * 1000; // 之后每 200ms
             timerfd_settime(cmd_timerfd, 0, &cts, nullptr);
-
-            auto cmd_timer_channel = std::make_shared<gateway::channel>();
-            cmd_timer_channel->fd     = cmd_timerfd;
-            cmd_timer_channel->events = EPOLLIN;   // LT
-            cmd_timer_channel->on_read = [cmd_timerfd, &inflight, &port]() {
-                uint64_t exp = 0;
-                read(cmd_timerfd, &exp, sizeof(exp));   // 必须读掉,否则 LT 反复触发
-
-                const long   TIMEOUT_SEC = 1;   // 超时时限(协议 §6.5 是 500ms;秒级 time() 精度有限,
-                                                //   取 1s 保守稳妥。要更精细可换 steady_clock 毫秒)
-                const int    MAX_RETRY   = 3;
-                long now = static_cast<long>(time(nullptr));
-
-                // 两阶段:先只读收集,再统一处理(避免遍历 inflight 时 erase/改导致迭代器失效)
-                std::vector<uint8_t> to_resend, to_fail;
-                for (auto& kv : inflight) {
-                    if (now - kv.second.sent_time > TIMEOUT_SEC) {
-                        if (kv.second.retry_count < MAX_RETRY) to_resend.push_back(kv.first);
-                        else                                   to_fail.push_back(kv.first);
-                    }
-                }
-                // 重发(同 seq,§6.2 幂等)
-                for (uint8_t seq : to_resend) {
-                    auto& c = inflight[seq];
-                    std::vector<uint8_t> payload;
-                    payload.push_back(seq);                       // 同 seq!
-                    for (uint8_t b : c.arg) payload.push_back(b);
-                    auto frame = gateway::buildFrame(c.type, payload);
-                    ssize_t w = port->write(frame.data(), frame.size());
-                    if (w == static_cast<ssize_t>(frame.size())) {
-                        c.retry_count++;
-                        c.sent_time = now;                        // 重置计时
-                        LOG_WARN("downlink RETRY seq=%u type=0x%02X (attempt %d/%d)",
-                                seq, c.type, c.retry_count, MAX_RETRY);
-                    } else {
-                        LOG_WARN("downlink retry send incomplete seq=%u ret=%zd", seq, w);
-                    }
-                }
-                // 重试耗尽,判失败删除
-                for (uint8_t seq : to_fail) {
-                    LOG_ERROR("downlink FAILED seq=%u type=0x%02X: no ACK after %d retries",
-                            seq, inflight[seq].type, MAX_RETRY);
-                    inflight.erase(seq);
-                    // 可选:发 MQTT 通知运维这条命令彻底失败
-                    // client.publish("gateway/ack/" + std::to_string(seq), "timeout");
-                }
-            };
-            loop.addChannel(cmd_timer_channel);
+            loop.addChannel(makeCmdTimerChannel(cmd_timerfd, inflight, port));
         }
 
         // ========================================================
@@ -438,88 +551,13 @@ int main(int argc, char* argv[]) {
             sig_channel->fd     = sfd;
             sig_channel->events = EPOLLIN;   // 信号 fd 用 LT 即可
             sig_channel->on_read =
-                [sfd, &loop, &db, &client, &port, &serial_channel, &cmd_queue, evfd]() {
+                [sfd, &loop, &db, &client, &port, &serial_channel, &parser, &cmd_queue, evfd]() {
                 struct signalfd_siginfo si;
                 // 必须读掉 siginfo,否则 LT 反复触发。while 读到 EAGAIN(SFD_NONBLOCK)。
                 while (read(sfd, &si, sizeof(si)) == static_cast<ssize_t>(sizeof(si))) {
                     if (si.ssi_signo != SIGHUP) continue;
-
-                    LOG_INFO("%s", "SIGHUP received, reloading config...");
-                    auto r = gateway::ConfigManager::reload();
-                    if (!r.ok) {
-                        // load-then-swap 保证旧配置原封不动,无需任何回滚动作
-                        LOG_WARN("%s","reload failed, keep running with old config");
-                        continue;
-                    }
-                    auto ncfg = gateway::ConfigManager::current();
-
-                    // ---- A 档:改内存即生效 ----
-                    gateway::Logger::setLevel(
-                        static_cast<gateway::LogLevel>(ncfg->log_level));
-                    // idle_timeout / report_n 等:用到处读 current() 自动生效
-
-                    // ---- B 档:按 diff 重建,且仅重建真变了的 ----
-                    // db:reset 旧 shared_ptr。在飞 task 持有旧 db 快照 → 旧对象续命到干完。
-                    if (r.db_changed) {
-                        LOG_INFO("%s","db_path changed → reopening database");
-                        db = std::make_shared<gateway::Database>(ncfg->db_path);
-                    }
-                    // mqtt:unique/shared_ptr 替换绕过 MqttClient 不可移动。
-                    //       旧 client 析构(stop loop/断连/destroy),新 client 建好。
-                    if (r.mqtt_changed) {
-                        LOG_INFO("%s","mqtt config changed → reconnecting");
-                        client = std::make_shared<gateway::MqttClient>(
-                            "gateway-main", ncfg->mqtt_host, ncfg->mqtt_port,
-                            ncfg->mqtt_keepalive);
-                        // 重连后要重新挂下行命令 handler + 重新订阅(否则下行命令断了)
-                        client->setMessageHandler([&cmd_queue, evfd](const std::string& topic, const std::string& payload){
-                            std::string cmd_name = topic;
-                            size_t pos = topic.find_last_of('/');
-                            if (pos != std::string::npos) cmd_name = topic.substr(pos + 1);
-                            DownCmd cmd;
-                            bool valid = true;
-                            if (cmd_name == "query_light")      { cmd.type = 0x20; }
-                            else if (cmd_name == "query_th")    { cmd.type = 0x21; }
-                            else if (cmd_name == "set_period")  {
-                                cmd.type = 0x22;
-                                try {
-                                    int period = std::stoi(payload);
-                                    if (period < 0 || period > 0xFFFF) { valid = false; }
-                                    else {
-                                        cmd.arg.push_back(static_cast<uint8_t>((period >> 8) & 0xFF));
-                                        cmd.arg.push_back(static_cast<uint8_t>(period & 0xFF));
-                                    }
-                                } catch (...) { valid = false; }
-                            } else { valid = false; }
-                            if (valid) {
-                                cmd_queue.push(std::move(cmd));
-                                uint64_t one = 1;
-                                if (write(evfd, &one, sizeof(one)) != sizeof(one))
-                                    LOG_WARN("%s", "eventfd notify failed");
-                            }
-                        });
-                        client->subscribe("gateway/cmd/#", 1);
-                        client->loopStart();
-                    }
-                    // serial:fd 在 epoll 里,要连 Channel 一起换。
-                    //   先 removeChannel 摘旧 fd(进 dying_,批末析构 close 旧 fd),
-                    //   再重建 port,再建【全新】channel 指向新 fd ——
-                    //   绝不复用旧 channel 改 fd:那会让旧 channel 的析构 close 错 fd
-                    //   (shared_ptr 别名坑:旧 channel 已在 dying_ 里)。
-                    if (r.serial_changed) {
-                        LOG_INFO("%s","serial config changed → reopening port");
-                        loop.removeChannel(serial_channel->fd);
-                        port = std::make_shared<gateway::SerialPort>(
-                            ncfg->serial_path.c_str(), toBaud(ncfg->serial_baud),
-                            /*nonblock=*/true);
-                        auto new_ch = std::make_shared<gateway::channel>();
-                        new_ch->fd      = port->get();
-                        new_ch->events  = EPOLLIN | EPOLLET;
-                        new_ch->on_read = serial_channel->on_read;  // 逻辑不变(引用捕获 port,自动用新 port)
-                        loop.addChannel(new_ch);
-                        serial_channel = new_ch;   // 外层变量指向新 channel(下次 SIGHUP 用新 fd)
-                    }
-                    LOG_INFO("%s","reload done");
+                    reloadConfig(loop, db, client, port, serial_channel,
+                                 parser, cmd_queue, evfd);
                 }
             };
             loop.addChannel(sig_channel);
