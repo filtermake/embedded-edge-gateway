@@ -177,7 +177,7 @@ mosquitto_sub -h localhost -t 'gateway/ack/#' -t 'gateway/resp/#' -v &
 
 mosquitto_pub -h localhost -t gateway/cmd/query_light -m ''      # 查询光照(0x20)
 mosquitto_pub -h localhost -t gateway/cmd/query_th    -m ''      # 查询温湿度(0x21)
-mosquitto_pub -h localhost -t gateway/cmd/set_period  -m 2000    # 设采样周期 2000ms(0x22)
+mosquitto_pub -h localhost -t gateway/cmd/set_period  -m 2000    # 设采样周期 2000 秒(0x22)
 ```
 
 > 虚拟串口下,`fake_stm32` 只发送传感器数据、不回应命令,所以下行命令会触发 3 次重试后判失败(可在网关日志观察重试/超时逻辑);要看到完整的 ACK 闭环,需用能回应命令的真实 STM32 固件。

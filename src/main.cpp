@@ -208,8 +208,8 @@ makeDownlinkHandler(gateway::ThreadSafeQueue<DownCmd>& cmd_queue, int evfd) {
         } else if (cmd_name == "query_th") {
             cmd.type = 0x21;                          // 查询温湿度,无参数
         } else if (cmd_name == "set_period") {
-            cmd.type = 0x22;                          // 设采样周期
-            // payload 是周期字符串如 "2000",转成 2 字节大端(协议 §3.4)
+            cmd.type = 0x22;                          // 设采样周期(单位:秒)
+            // payload 是周期秒数字符串如 "2000"(秒),转成 2 字节大端 uint16(协议 §3.4)
             try {
                 int period = std::stoi(payload);
                 if (period < 0 || period > 0xFFFF) {
